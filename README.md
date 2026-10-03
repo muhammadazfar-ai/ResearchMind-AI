@@ -1,6 +1,6 @@
----
+﻿---
 title: ResearchMind AI
-emoji: ??
+emoji: 🧠
 colorFrom: blue
 colorTo: indigo
 sdk: gradio
