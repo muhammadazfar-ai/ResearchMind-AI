@@ -1,13 +1,43 @@
-import html
 import os
+import sys
+
+# ======================================================
+# 1. PATH RESOLUTION (Must run before any 'src' imports)
+# ======================================================
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+PARENT_DIR = os.path.dirname(APP_DIR)
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+
+# ======================================================
+# 2. STANDARD LIBRARY IMPORTS
+# ======================================================
+import html
 import re
 import tempfile
 import threading
 import uuid
 
+# ======================================================
+# 3. THIRD-PARTY IMPORTS
+# ======================================================
+import streamlit as st
 from dotenv import find_dotenv, load_dotenv
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
-# Search up the directory tree to find .env and load environment variables
+# ======================================================
+# 4. LOCAL MODULE IMPORTS (src)
+# ======================================================
+from src.config import DEFAULT_DEPTH, DEPTH_PRESETS, LANGUAGES, MAX_UPLOAD_FILES, MODES
+from src.embeddings import get_embedding_model
+from src.pipeline import run_research
+
+# Load environment variables
 load_dotenv(find_dotenv(), override=True)
 
 # Startup verification logs for keys
@@ -16,28 +46,75 @@ if not os.getenv("GROQ_API_KEY"):
 if not os.getenv("TAVILY_API_KEY"):
     print("[WARNING] TAVILY_API_KEY was not found in .env or environment variables.")
 
-import gradio as gr
-from reportlab.lib.pagesizes import LETTER
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
-
-from src.config import DEFAULT_DEPTH, DEPTH_PRESETS, LANGUAGES, MAX_UPLOAD_FILES, MODES
-from src.embeddings import get_embedding_model
-from src.pipeline import run_research
-
 REPORTS_DIR = os.path.join(tempfile.gettempdir(), "researchmind_reports")
 
+# ======================================================
+# 5. PAGE & STYLES CONFIGURATION
+# ======================================================
+st.set_page_config(
+    page_title="ResearchMind AI",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+custom_css = """
+<style>
+    /* Dark Theme Setup */
+    .stApp {
+        background-color: #0b0e14;
+        color: #adbac7;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #0d1117;
+        border-right: 1px solid #2d333b;
+    }
+
+    /* Input Bar & Containers */
+    .stTextInput input {
+        background-color: #1c2128 !important;
+        color: #ffffff !important;
+        border: 1px solid #2d333b !important;
+        border-radius: 10px !important;
+    }
+
+    /* Trace Box Styling */
+    .trace-box {
+        background: #0d1117;
+        border: 1px solid #2d333b;
+        border-radius: 12px;
+        padding: 12px 16px;
+        font-size: 14px;
+        margin-bottom: 12px;
+    }
+
+    /* RTL Support for Urdu */
+    .rtl-text {
+        direction: rtl;
+        text-align: right;
+    }
+
+    /* Hide standard Streamlit header & footer */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+</style>
+"""
+st.markdown(custom_css, unsafe_allow_html=True)
+
 
 # ======================================================
-# EXPORT (Markdown + PDF)
+# 6. EXPORT HELPERS (Markdown + PDF)
 # ======================================================
 def _pdf_safe(text: str) -> str:
-    """Standard PDF fonts only cover Windows-1252, so drop emoji and other unsupported symbols."""
+    """Standard PDF fonts only cover Windows-1252, so drop emoji and unsupported symbols."""
     return text.encode("cp1252", "ignore").decode("cp1252")
 
 
 def create_markdown(text: str):
-    """Saves the report as a .md file (works for every language)."""
+    """Saves the report as a .md file."""
     if not text or len(text.strip()) < 10:
         return None
     os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -48,7 +125,7 @@ def create_markdown(text: str):
 
 
 def create_pdf(text: str):
-    """Builds a PDF from the markdown report. English/Latin text only (see README for Urdu)."""
+    """Builds a PDF from the markdown report."""
     if not text or len(text.strip()) < 10:
         return None
     try:
@@ -61,7 +138,7 @@ def create_pdf(text: str):
             if not line:
                 story.append(Spacer(1, 8))
                 continue
-            if set(line) <= {"-", " "}:  # horizontal rule
+            if set(line) <= {"-", " "}:  # Horizontal rule
                 story.append(Spacer(1, 6))
                 continue
 
@@ -95,202 +172,130 @@ def export_files(report: str, language: str) -> list:
 
 
 # ======================================================
-# CORE HANDLER
+# 7. BACKGROUND WARM-UP
 # ======================================================
-def run_agent(topic, mode, language, depth, use_web, doc_files):
-    """Streams the agent pipeline into the UI: live activity log, report, then downloadable files."""
-    if not topic or len(topic.strip()) < 2:
-        yield (
-            gr.update(visible=True),
-            gr.update(value="", visible=False),
-            gr.update(value="", visible=False),
-            gr.update(value=None, visible=False),
-        )
-        return
-
-    rtl = language == "Urdu"
-    try:
-        for event in run_research(
-            topic.strip(), mode, language, depth, use_web, [getattr(f, "name", f) for f in (doc_files or [])]
-        ):
-            report_update = gr.update() if event["report"] is None else gr.update(value=event["report"], visible=True, rtl=rtl)
-            files_update = gr.update(value=None, visible=False)
-            if event["done"]:
-                files = export_files(event["result"]["report"], language)
-                files_update = gr.update(value=files, visible=bool(files))
-            yield gr.update(visible=False), gr.update(value=event["trace"], visible=True), report_update, files_update
-            if event["error"]:
-                return
-    except Exception as e:
-        yield (
-            gr.update(visible=False),
-            gr.update(),
-            gr.update(value=f"### ❌ An Error Occurred:\n`{str(e)}`", visible=True),
-            gr.update(value=None, visible=False),
-        )
-
-
-def reset_ui():
-    """Resets the UI state for starting a new research session."""
-    return (
-        "",                                    # clear search input
-        gr.update(visible=True),               # show welcome text
-        gr.update(value="", visible=False),    # clear activity log
-        gr.update(value="", visible=False),    # clear report
-        gr.update(value=None, visible=False),  # clear downloads
-    )
-
-
-# ======================================================
-# STYLES
-# ======================================================
-custom_css = """
-body, .gradio-container { 
-    background-color: #0b0e14 !important; 
-    color: #adbac7 !important; 
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
-}
-footer { display: none !important; }
-
-.sidebar-gpt { 
-    background-color: #0d1117 !important; 
-    border-right: 1px solid #2d333b !important; 
-    padding: 16px !important; 
-}
-.sidebar-btn { 
-    background: transparent !important;
-    border: 1px solid #2d333b !important;
-    color: #adbac7 !important;
-    text-align: left !important;
-    justify-content: flex-start !important;
-    padding: 10px 14px !important; 
-    border-radius: 10px !important; 
-    cursor: pointer !important; 
-    font-size: 14px !important;
-    margin-bottom: 8px !important;
-    width: 100% !important;
-}
-.sidebar-btn:hover { 
-    background: #1c2128 !important; 
-    color: #ffffff !important; 
-}
-
-.chat-container { 
-    max-width: 850px !important; 
-    margin: 0 auto !important; 
-    padding-bottom: 40px !important; 
-}
-.welcome-text { 
-    font-size: 32px; 
-    font-weight: 700; 
-    text-align: center; 
-    margin-top: 40px; 
-    color: #ffffff; 
-}
-
-.report-gpt { 
-    color: #adbac7 !important; 
-    font-size: 16px !important; 
-    line-height: 1.7 !important; 
-}
-.report-gpt h1, .report-gpt h2, .report-gpt h3 { 
-    color: #ffffff !important; 
-}
-
-.input-bar-gpt { 
-    background: #1c2128 !important; 
-    border: 1px solid #2d333b !important; 
-    border-radius: 16px !important; 
-    padding: 8px 16px !important; 
-    align-items: center !important;
-}
-
-.trace-box {
-    background: #0d1117 !important;
-    border: 1px solid #2d333b !important;
-    border-radius: 12px !important;
-    padding: 12px 16px !important;
-    font-size: 14px !important;
-    margin-bottom: 12px !important;
-}
-
-.send-btn { 
-    background: #10a37f !important; 
-    color: white !important; 
-    border-radius: 50% !important; 
-    min-width: 40px !important;
-    height: 40px !important;
-    border: none !important;
-}
-"""
-
-# ======================================================
-# UI STRUCTURE
-# ======================================================
-with gr.Blocks(title="ResearchMind AI") as app:
-    with gr.Row():
-        # LEFT SIDEBAR
-        with gr.Column(scale=1, elem_classes="sidebar-gpt", min_width=240):
-            gr.HTML("""<div style="font-size:20px; font-weight:800; margin-bottom:20px; color:#ffffff;">ResearchMind</div>""")
-            new_research_btn = gr.Button("➕  New Research", elem_classes="sidebar-btn")
-            gr.Markdown(
-                "**How it works**\n\n"
-                "1. 🧭 **Planner** splits your topic\n"
-                "2. 🔍 **Researcher** searches the web\n"
-                "3. 🧩 **Retriever** indexes & ranks passages\n"
-                "4. ✍️ **Writer** drafts with citations\n"
-                "5. 🔎 **Checker** verifies every claim\n"
-                "6. 🛠️ **Reviser** fixes weak claims\n"
-            )
-
-        # MAIN AREA
-        with gr.Column(scale=4):
-            with gr.Row():
-                mode = gr.Dropdown(choices=MODES, value="Standard", label="Style", scale=2)
-                depth = gr.Dropdown(choices=list(DEPTH_PRESETS), value=DEFAULT_DEPTH, label="Depth", scale=2)
-                language = gr.Dropdown(choices=LANGUAGES, value="English", label="Language", scale=2)
-
-            with gr.Column(elem_classes="chat-container"):
-                welcome = gr.HTML('<div class="welcome-text">What would you like to research?</div>')
-                trace_out = gr.Markdown(visible=False, elem_classes="trace-box")
-                report_out = gr.Markdown(visible=False, elem_classes="report-gpt")
-                files_out = gr.File(label="Download report", file_count="multiple", visible=False)
-
-            with gr.Row(elem_classes="input-bar-gpt"):
-                query = gr.Textbox(placeholder="Ask anything...", lines=1, container=False, scale=10)
-                submit_btn = gr.Button("↑", variant="primary", elem_classes="send-btn", scale=1)
-
-            with gr.Row():
-                use_web = gr.Checkbox(label="🌐 Include web search", value=True)
-            with gr.Accordion(f"📎 Add your own documents (PDF, TXT, MD — up to {MAX_UPLOAD_FILES})", open=False):
-                doc_files = gr.File(file_count="multiple", file_types=[".pdf", ".txt", ".md"], label="Your documents")
-
-    # Event handlers
-    run_inputs = [query, mode, language, depth, use_web, doc_files]
-    run_outputs = [welcome, trace_out, report_out, files_out]
-
-    submit_event = submit_btn.click(fn=run_agent, inputs=run_inputs, outputs=run_outputs)
-    submit_event.then(fn=lambda: "", outputs=[query])
-
-    query_event = query.submit(fn=run_agent, inputs=run_inputs, outputs=run_outputs)
-    query_event.then(fn=lambda: "", outputs=[query])
-
-    new_research_btn.click(fn=reset_ui, outputs=[query, welcome, trace_out, report_out, files_out])
-
-
-def _warm_up():
-    """Loads the embedding model in the background so the first search is not slow."""
-    try:
-        get_embedding_model()
-    except Exception as e:
-        print(f"[DEBUG WARNING] Embedding model warm-up failed: {e}")
-
-if __name__ == "__main__":
+@st.cache_resource
+def warm_up_embeddings():
+    """Loads the embedding model into cache in the background."""
+    def _warm_up():
+        try:
+            get_embedding_model()
+        except Exception as e:
+            print(f"[DEBUG WARNING] Embedding model warm-up failed: {e}")
+    
     threading.Thread(target=_warm_up, daemon=True).start()
-    app.queue(default_concurrency_limit=3)
-    app.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),
-        inbrowser=not os.getenv("SPACE_ID"),
-        css=custom_css
+
+warm_up_embeddings()
+
+
+# ======================================================
+# 8. SIDEBAR UI
+# ======================================================
+with st.sidebar:
+    st.title("ResearchMind")
+    
+    if st.button("➕  New Research", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown(
+        "**How it works**\n\n"
+        "1. 🧭 **Planner** splits your topic\n"
+        "2. 🔍 **Researcher** searches the web\n"
+        "3. 🧩 **Retriever** indexes & ranks passages\n"
+        "4. ✍️ **Writer** drafts with citations\n"
+        "5. 🔎 **Checker** verifies every claim\n"
+        "6. 🛠️️ **Reviser** fixes weak claims"
     )
+
+
+# ======================================================
+# 9. MAIN CONTENT AREA
+# ======================================================
+col1, col2, col3 = st.columns(3)
+with col1:
+    mode = st.selectbox("Style", options=MODES, index=MODES.index("Standard") if "Standard" in MODES else 0)
+with col2:
+    depth = st.selectbox("Depth", options=list(DEPTH_PRESETS), index=list(DEPTH_PRESETS).index(DEFAULT_DEPTH) if DEFAULT_DEPTH in DEPTH_PRESETS else 0)
+with col3:
+    language = st.selectbox("Language", options=LANGUAGES, index=LANGUAGES.index("English") if "English" in LANGUAGES else 0)
+
+query = st.text_input("What would you like to research?", placeholder="Ask anything...", key="user_query")
+use_web = st.checkbox("🌐 Include web search", value=True)
+
+with st.expander(f"📎 Add your own documents (PDF, TXT, MD — up to {MAX_UPLOAD_FILES})"):
+    uploaded_files = st.file_uploader(
+        "Your documents", 
+        type=["pdf", "txt", "md"], 
+        accept_multiple_files=True
+    )
+
+# Save uploaded files into temp storage for pipeline processing
+temp_doc_paths = []
+if uploaded_files:
+    if len(uploaded_files) > MAX_UPLOAD_FILES:
+        st.warning(f"Maximum allowed files is {MAX_UPLOAD_FILES}. Processing first {MAX_UPLOAD_FILES} files only.")
+        uploaded_files = uploaded_files[:MAX_UPLOAD_FILES]
+    
+    for uf in uploaded_files:
+        temp_path = os.path.join(tempfile.gettempdir(), uf.name)
+        with open(temp_path, "wb") as f:
+            f.write(uf.getbuffer())
+        temp_doc_paths.append(temp_path)
+
+# ======================================================
+# 10. EXECUTION & STREAMING LOGIC
+# ======================================================
+if st.button("Start Research 🚀", type="primary", use_container_width=True):
+    if not query or len(query.strip()) < 2:
+        st.warning("Please enter a valid research topic.")
+    else:
+        trace_container = st.empty()
+        report_container = st.empty()
+        downloads_container = st.container()
+
+        rtl = (language == "Urdu")
+        
+        try:
+            for event in run_research(
+                query.strip(), mode, language, depth, use_web, temp_doc_paths
+            ):
+                # Update trace output live
+                if event.get("trace"):
+                    trace_container.markdown(f'<div class="trace-box">{event["trace"]}</div>', unsafe_allow_html=True)
+                
+                # Update report content live
+                if event.get("report"):
+                    if rtl:
+                        report_container.markdown(f'<div class="rtl-text">{event["report"]}</div>', unsafe_allow_html=True)
+                    else:
+                        report_container.markdown(event["report"])
+                
+                # Render file export buttons when execution completes
+                if event.get("done"):
+                    final_report = event["result"]["report"]
+                    files = export_files(final_report, language)
+                    
+                    with downloads_container:
+                        st.markdown("### 📥 Download Reports")
+                        d_cols = st.columns(len(files))
+                        for idx, file_path in enumerate(files):
+                            file_name = os.path.basename(file_path)
+                            mime_type = "application/pdf" if file_name.endswith(".pdf") else "text/markdown"
+                            
+                            with open(file_path, "rb") as f:
+                                d_cols[idx].download_button(
+                                    label=f"Download {file_name.split('.')[-1].upper()}",
+                                    data=f.read(),
+                                    file_name=file_name,
+                                    mime=mime_type,
+                                    key=f"download_{idx}"
+                                )
+
+                if event.get("error"):
+                    st.error("An error occurred during execution.")
+                    break
+
+        except Exception as e:
+            st.error(f"### ❌ An Error Occurred:\n`{str(e)}`")
